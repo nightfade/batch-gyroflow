@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Built locally by build_app.sh; the bundle hard-codes an absolute path,
+# so it is rebuilt per machine rather than committed.
+BatchGyroflow.app/
