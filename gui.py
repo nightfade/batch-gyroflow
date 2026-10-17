@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Local web UI for batch_gyroflow.py -- standard library only.
 
-Starts a loopback HTTP server, opens the default browser at it, and drives
-batch_gyroflow.py as a subprocess while streaming its output back to the page.
+Starts a loopback HTTP server and opens the default browser at it. The page
+collects the options and writes a bash script that runs batch_gyroflow.py; the
+batch itself runs in Terminal, so progress and errors are visible as they
+happen and the full output is also saved to a log next to the script.
 
 Why a browser and not a native window: this machine has no tkinter (Homebrew's
 python@3.14 omits it) and no Xcode, and a web page needs nothing installed.
@@ -17,17 +19,15 @@ from __future__ import annotations
 
 import http.server
 import json
-import os
-import queue
-import re
 import secrets
-import signal
+import shlex
 import socket
 import subprocess
 import sys
 import threading
 import urllib.parse
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,139 +35,65 @@ from typing import Any
 SCRIPT = Path(__file__).resolve().parent / "batch_gyroflow.py"
 TOKEN = secrets.token_urlsafe(16)
 
-# `[abc1234] Rendering progress: 55/60 frames (91.7%) ETA 0.1s`
-PROGRESS_RE = re.compile(r"progress:\s*(\d+)/(\d+)\s*frames", re.IGNORECASE)
-QUEUED_RE = re.compile(r"queued\s+(\d+)")
-STAGE_RE = re.compile(r"^(Rendering|Applying LUT):\s*(.+)$")
+RUNS_DIR = "_runs"
+# Scripts this server wrote; only these may be opened in Terminal or Finder.
+GENERATED: set[str] = set()
 
 
-class Job:
-    """The single running batch, plus the state the page renders."""
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.process: subprocess.Popen[bytes] | None = None
-        self.listeners: list[queue.Queue[str]] = []
-        self.state: dict[str, Any] = self._idle()
-
-    @staticmethod
-    def _idle() -> dict[str, Any]:
-        return {
-            "running": False,
-            "total": 0,
-            "done": 0,
-            "failed": 0,
-            "skipped": 0,
-            "file": "",
-            "stage": "",
-            "percent": None,
-            "exit": None,
-        }
-
-    def publish(self, kind: str, payload: Any) -> None:
-        message = json.dumps({"kind": kind, "payload": payload})
-        with self.lock:
-            listeners = list(self.listeners)
-        for listener in listeners:
-            try:
-                listener.put_nowait(message)
-            except queue.Full:
-                pass
-
-    def subscribe(self) -> queue.Queue[str]:
-        listener: queue.Queue[str] = queue.Queue(maxsize=2000)
-        with self.lock:
-            self.listeners.append(listener)
-        listener.put_nowait(json.dumps({"kind": "state", "payload": self.state}))
-        return listener
-
-    def unsubscribe(self, listener: queue.Queue[str]) -> None:
-        with self.lock:
-            if listener in self.listeners:
-                self.listeners.remove(listener)
-
-    def update(self, **changes: Any) -> None:
-        self.state.update(changes)
-        self.publish("state", self.state)
-
-    def start(self, command: list[str]) -> None:
-        with self.lock:
-            if self.process is not None and self.process.poll() is None:
-                raise RuntimeError("a batch is already running")
-        self.state = self._idle()
-        self.update(running=True)
-        self.publish("log", "$ " + " ".join(command))
-        # Own process group so Stop can take Gyroflow/ffmpeg down with it.
-        self.process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        threading.Thread(target=self._pump, daemon=True).start()
-
-    def _pump(self) -> None:
-        assert self.process is not None and self.process.stdout is not None
-        buffer = b""
-        while True:
-            chunk = self.process.stdout.read(1)
-            if not chunk:
-                break
-            # Gyroflow redraws progress with \r, so split on both terminators.
-            if chunk in (b"\n", b"\r"):
-                if buffer:
-                    self._consume(buffer.decode("utf-8", "replace"))
-                    buffer = b""
-            else:
-                buffer += chunk
-        if buffer:
-            self._consume(buffer.decode("utf-8", "replace"))
-        code = self.process.wait()
-        self.update(running=False, exit=code, stage="", percent=None)
-        self.publish("log", f"— finished, exit code {code} —")
-
-    def _consume(self, line: str) -> None:
-        text = line.rstrip()
-        if not text:
-            return
-
-        match = PROGRESS_RE.search(text)
-        if match:
-            current, total = int(match.group(1)), int(match.group(2))
-            if total:
-                self.update(percent=round(current * 100 / total, 1))
-            return  # too noisy for the log
-
-        self.publish("log", text)
-
-        match = STAGE_RE.match(text)
-        if match:
-            self.update(stage=match.group(1), file=match.group(2), percent=None)
-            return
-        match = QUEUED_RE.search(text)
-        if match:
-            self.update(total=int(match.group(1)))
-            return
-        if text.startswith("OK:"):
-            self.update(done=self.state["done"] + 1, percent=None)
-        elif text.startswith("FAILED"):
-            self.update(failed=self.state["failed"] + 1, percent=None)
-        elif text.startswith("SKIP"):
-            self.update(skipped=self.state["skipped"] + 1)
-
-    def stop(self) -> bool:
-        process = self.process
-        if process is None or process.poll() is not None:
-            return False
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            process.terminate()
-        self.publish("log", "— stop requested —")
-        return True
+def runs_dir(config: dict[str, Any]) -> Path:
+    """`<output>/_runs`. batch_gyroflow.py never scans its own output tree."""
+    output = str(config.get("output") or "").strip()
+    root = Path(output) if output else Path(str(config["source"]).strip()) / "gyroflow_stabilized"
+    return root.expanduser() / RUNS_DIR
 
 
-JOB = Job()
+def render_script(command: list[str], log: Path, summary: str) -> str:
+    return f"""#!/bin/bash
+# Batch Gyroflow -- generated by gui.py at {datetime.now():%Y-%m-%d %H:%M:%S}
+# {summary}
+set -o pipefail
+
+LOG={shlex.quote(str(log))}
+echo "日志：${{LOG}}"
+echo
+
+{shlex.join(command)} 2>&1 | tee "${{LOG}}"
+status=${{PIPESTATUS[0]}}
+
+echo
+if [ "${{status}}" -eq 0 ]; then
+  echo "✅ 完成"
+else
+  echo "❌ 失败，退出码 ${{status}}。完整输出见：${{LOG}}"
+fi
+# Keep the Terminal window open so the result stays readable.
+if [ -t 0 ]; then read -n 1 -s -r -p "按任意键关闭"; echo; fi
+exit "${{status}}"
+"""
+
+
+def write_script(config: dict[str, Any]) -> Path:
+    command = build_command(config)
+    folder = runs_dir(config)
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{'dryrun' if config.get('dry_run') else 'run'}_{stamp}"
+    script = folder / f"{name}.sh"
+    mode = {"stabilize": "增稳", "stabilize_lut": "增稳 + LUT", "lut_only": "只套 LUT"}.get(
+        config.get("mode") or "stabilize", "增稳"
+    )
+    summary = f"模式：{mode}{'（试跑）' if config.get('dry_run') else ''}；素材：{str(config['source']).strip()}"
+    script.write_text(render_script(command, folder / f"{name}.log", summary), encoding="utf-8")
+    script.chmod(0o755)
+    GENERATED.add(str(script))
+    return script
+
+
+def open_generated(path: str, reveal: bool) -> None:
+    if path not in GENERATED:
+        raise ValueError("Unknown script")
+    args = ["open", "-R", path] if reveal else ["open", "-a", "Terminal", path]
+    subprocess.run(args, check=True)
 
 
 def choose_path(kind: str) -> str:
@@ -288,11 +214,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(403, b"Invalid or missing token", "text/plain")
                 return
             self._send(200, PAGE.replace("__TOKEN__", TOKEN).encode(), "text/html; charset=utf-8")
-        elif route == "/api/events":
-            if not self._authorised():
-                self._send(403, b"forbidden", "text/plain")
-                return
-            self._stream()
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -304,39 +225,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if route == "/api/choose":
                 self._json({"path": choose_path(self._body().get("kind", "folder"))})
-            elif route == "/api/start":
-                JOB.start(build_command(self._body()))
+            elif route == "/api/script":
+                script = write_script(self._body())
+                self._json({"path": str(script), "command": f"bash {shlex.quote(str(script))}"})
+            elif route == "/api/terminal":
+                open_generated(self._body().get("path", ""), reveal=False)
                 self._json({"ok": True})
-            elif route == "/api/stop":
-                self._json({"stopped": JOB.stop()})
+            elif route == "/api/reveal":
+                open_generated(self._body().get("path", ""), reveal=True)
+                self._json({"ok": True})
             elif route == "/api/quit":
                 self._json({"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:
                 self._json({"error": "not found"}, 404)
-        except (ValueError, RuntimeError, KeyError) as error:
+        except (ValueError, RuntimeError, KeyError, OSError, subprocess.CalledProcessError) as error:
             self._json({"error": str(error)}, 400)
-
-    def _stream(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        listener = JOB.subscribe()
-        try:
-            while True:
-                try:
-                    message = listener.get(timeout=15)
-                except queue.Empty:
-                    self.wfile.write(b": keepalive\n\n")  # keep proxies/browsers happy
-                    self.wfile.flush()
-                    continue
-                self.wfile.write(f"data: {message}\n\n".encode())
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            JOB.unsubscribe(listener)
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -372,15 +276,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
 details summary{cursor:pointer;color:var(--mut);margin-bottom:12px}
 .adv{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 .adv label{display:block;margin-bottom:3px;font-size:12px}
-.bar{height:7px;background:var(--line);border-radius:4px;overflow:hidden;margin:10px 0 6px}
-.bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .2s}
-.bar>i.indet{width:35%;animation:sweep 1.1s ease-in-out infinite}
-@keyframes sweep{0%{margin-left:-35%}100%{margin-left:100%}}
-.status{display:flex;justify-content:space-between;color:var(--mut);font-size:12px}
-pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:11px;
-height:230px;overflow:auto;margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
-white-space:pre-wrap;word-break:break-all}
-.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+.script{display:none;margin-top:14px}
+.script code{display:block;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+padding:9px 11px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+.script .actions{margin-top:10px}
+.hint{color:var(--mut);font-size:12px;margin-top:8px}
 .err{color:var(--bad);margin-top:10px;min-height:18px;font-size:13px}
 .actions{display:flex;gap:9px;margin-top:16px;align-items:center}
 .actions .sp{flex:1}
@@ -432,23 +332,26 @@ white-space:pre-wrap;word-break:break-all}
 </div></details>
 
 <div class="card">
-  <div class="bar"><i id="bar"></i></div>
-  <div class="status"><span id="now">就绪</span><span id="tally"></span></div>
   <div class="actions">
-    <button class="primary" id="start">开始</button>
-    <button id="dry">试跑</button>
-    <button id="stop" disabled>停止</button>
+    <button class="primary" id="start">生成脚本</button>
+    <button id="dry">生成试跑脚本</button>
     <span class="sp"></span>
-    <button id="clear">清空日志</button>
     <button id="quit">退出</button>
   </div>
   <div class="err" id="err"></div>
+  <div class="script" id="script">
+    <code id="cmd"></code>
+    <div class="actions">
+      <button class="primary" id="terminal">在终端运行</button>
+      <button id="reveal">在 Finder 中显示</button>
+      <button id="copy">复制命令</button>
+    </div>
+    <div class="hint">进度和报错直接显示在终端里，完整输出同时存进脚本旁边的同名 .log。</div>
+  </div>
 </div>
-
-<pre id="log"></pre>
 </div><script>
 const T="__TOKEN__", $=id=>document.getElementById(id);
-let mode="stabilize", running=false;
+let mode="stabilize", scriptPath="";
 
 const api=async(path,body)=>{
   const r=await fetch(path+"?token="+T,{method:"POST",headers:{"Content-Type":"application/json","X-Token":T},
@@ -485,39 +388,20 @@ const config=dry=>({mode,dry_run:dry,
   overwrite:val("overwrite"), keep_intermediate:val("keep_intermediate"),
   no_recursive:val("no_recursive"), require_gyro:val("require_gyro")});
 
-const run=async dry=>{ $("err").textContent="";
-  try{ await api("/api/start",config(dry)); }catch(e){ $("err").textContent=e.message; } };
-$("start").onclick=()=>run(false);
-$("dry").onclick=()=>run(true);
-$("stop").onclick=()=>api("/api/stop").catch(e=>$("err").textContent=e.message);
-$("clear").onclick=()=>$("log").textContent="";
+const generate=async dry=>{ $("err").textContent="";
+  try{
+    const d=await api("/api/script",config(dry));
+    scriptPath=d.path; $("cmd").textContent=d.command; $("script").style.display="block";
+  }catch(e){ $("err").textContent=e.message; } };
+$("start").onclick=()=>generate(false);
+$("dry").onclick=()=>generate(true);
+$("terminal").onclick=()=>api("/api/terminal",{path:scriptPath}).catch(e=>$("err").textContent=e.message);
+$("reveal").onclick=()=>api("/api/reveal",{path:scriptPath}).catch(e=>$("err").textContent=e.message);
+$("copy").onclick=async()=>{ await navigator.clipboard.writeText($("cmd").textContent);
+  $("copy").textContent="已复制"; setTimeout(()=>$("copy").textContent="复制命令",1500); };
 $("quit").onclick=async()=>{ await api("/api/quit").catch(()=>{}); document.body.innerHTML=
   '<div class="wrap"><h1>已退出</h1><p style="color:var(--mut)">可以关闭这个标签页了。</p></div>'; };
 
-const cls=t=>t.startsWith("OK:")?"ok":(t.startsWith("FAILED")?"bad":
-  (t.startsWith("WARNING")||t.startsWith("NOTE")||t.startsWith("SKIP")?"warn":""));
-
-const es=new EventSource("/api/events?token="+T);
-es.onmessage=e=>{
-  const {kind,payload}=JSON.parse(e.data);
-  if(kind==="log"){
-    const box=$("log"), atEnd=box.scrollTop+box.clientHeight>=box.scrollHeight-30;
-    const s=document.createElement("span"); s.className=cls(payload); s.textContent=payload+"\n";
-    box.appendChild(s); if(atEnd) box.scrollTop=box.scrollHeight;
-    return;
-  }
-  const st=payload; running=st.running;
-  $("start").disabled=running; $("dry").disabled=running; $("stop").disabled=!running;
-  const bar=$("bar");
-  if(st.percent!==null&&st.percent!==undefined){ bar.className=""; bar.style.width=st.percent+"%"; }
-  else if(running&&st.stage){ bar.className="indet"; bar.style.width=""; }
-  else { bar.className=""; bar.style.width=(st.total?100*st.done/st.total:0)+"%"; }
-  $("now").textContent = running
-    ? (st.stage?`${st.stage==="Rendering"?"渲染":"套 LUT"} ${st.file}`:"准备中…")
-    : (st.exit===null?"就绪":(st.exit===0?"完成":`结束，退出码 ${st.exit}`));
-  $("tally").textContent = st.total||st.done||st.failed||st.skipped
-    ? `${st.done} 成功 · ${st.failed} 失败 · ${st.skipped} 跳过 / 共 ${st.total}` : "";
-};
 </script></body></html>
 """
 
@@ -550,7 +434,6 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        JOB.stop()
         server.server_close()
     return 0
 

@@ -25,8 +25,15 @@ need Gyroflow installed at all.
 
 Double-clicking it starts a loopback web server and opens the page in your
 browser. It exposes mode, source, output, LUT, max crop and date naming, with
-codec / bitrate / jobs / timeout / rolling-shutter behind **高级选项**, plus a
-live log, per-file progress and a Stop button.
+codec / bitrate / jobs / timeout / rolling-shutter behind **高级选项**.
+
+The page does not run the batch itself. **生成脚本** (or **生成试跑脚本**)
+writes a bash script to `<output>/_runs/run_YYYYmmdd_HHMMSS.sh`, and
+**在终端运行** opens it in Terminal. Progress and errors show up there as they
+happen, and the full output is also written to a `.log` with the same name.
+The script exits with batch_gyroflow.py's exit code and keeps the Terminal
+window open until a key is pressed. You can also run it later yourself with
+`bash <path>`; Ctrl-C stops it and cleans up partial `.tmp` files.
 
 Build it on each Mac rather than copying the bundle — it takes a second, needs
 only the system tools, and avoids the Gatekeeper prompt a copied ad-hoc-signed
@@ -44,11 +51,6 @@ Notes:
   paths, so the server shells out to `osascript` and returns the choice.
 - The server binds to 127.0.0.1 and every request needs a per-run token, so
   another page in the same browser cannot drive it.
-- Progress percentages come from Gyroflow's own output. The ffmpeg LUT stage
-  reports none, so it shows an indeterminate bar.
-- Stop sends SIGTERM to the whole process group; `batch_gyroflow.py` handles it
-  through the same path as Ctrl-C, so partial `.tmp` files are cleaned up.
-
 ## Requirements
 
 | | macOS | Linux |
