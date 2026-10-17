@@ -17,6 +17,23 @@ In LUT-only mode Gyroflow is never launched, no staging file is written, and
 the gyro-metadata probe is skipped — so it works on any footage and does not
 need Gyroflow installed at all.
 
+## Quick start (macOS)
+
+```bash
+brew install --cask gyroflow        # not the Mac App Store build, see Requirements
+brew install ffmpeg python
+git clone https://github.com/nightfade/batch-gyroflow.git ~/Github/batch-gyroflow
+cd ~/Github/batch-gyroflow
+./build_app.sh                      # installs BatchGyroflow.app into /Applications
+```
+
+Open **Batch Gyroflow** from Applications, pick the source folder and mode,
+click **生成脚本**, then **在终端运行**. Or skip the app and use the command
+line directly, see [Dry run](#dry-run) and [Render](#render).
+
+The app points at the cloned folder, so keep it where it is; `git pull` there
+updates the tool without rebuilding.
+
 ## GUI
 
 ```bash
