@@ -17,13 +17,17 @@ so another page in the same browser cannot drive this server.
 
 from __future__ import annotations
 
+import hashlib
 import http.server
+import importlib.util
 import json
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
 import webbrowser
@@ -38,6 +42,137 @@ TOKEN = secrets.token_urlsafe(16)
 RUNS_DIR = "_runs"
 # Scripts this server wrote; only these may be opened in Terminal or Finder.
 GENERATED: set[str] = set()
+
+# Remembered between launches; the page's own storage is lost because every
+# run gets a new port and therefore a new origin.
+SETTINGS = Path.home() / "Library" / "Application Support" / "BatchGyroflow" / "gui.json"
+PREVIEW_DIR = Path(tempfile.mkdtemp(prefix="batch-gyroflow-preview-"))
+PREVIEW_WIDTHS = (360, 1280)
+_BASE_LOCK = threading.Lock()
+
+
+def _load_batch_module() -> Any:
+    spec = importlib.util.spec_from_file_location("batch_gyroflow", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+BATCH = _load_batch_module()
+
+
+def load_settings() -> dict[str, Any]:
+    try:
+        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(changes: dict[str, Any]) -> dict[str, Any]:
+    settings = {**load_settings(), **{k: v for k, v in changes.items() if k in ("lut_dir",)}}
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    return settings
+
+
+def list_clips(source: str) -> list[str]:
+    """Videos the batch would pick up, so the preview frame is real footage."""
+    root = Path(source.strip()).expanduser()
+    if not source.strip() or not root.is_dir():
+        return []
+    videos = BATCH.discover_videos(
+        root, root / "gyroflow_stabilized", recursive=True, suffix="_stabilized"
+    )
+    return [str(video) for video in videos if not video.name.startswith("._")]
+
+
+def list_luts(folder: str) -> list[str]:
+    root = Path(folder.strip()).expanduser()
+    if not folder.strip() or not root.is_dir():
+        return []
+    # `._name.cube` are AppleDouble stubs that macOS leaves on exFAT cards.
+    luts = [
+        path
+        for path in root.rglob("*")
+        if path.suffix.lower() == ".cube" and path.is_file() and not path.name.startswith(".")
+    ]
+    return [str(path) for path in sorted(luts, key=lambda path: str(path).lower())]
+
+
+def _probe_duration(clip: Path) -> float:
+    completed = subprocess.run(
+        [str(BATCH.DEFAULT_FFPROBE), "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(clip)],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        return max(float(completed.stdout.strip()), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def _cache_key(*parts: object) -> str:
+    return hashlib.sha1("\0".join(map(str, parts)).encode()).hexdigest()[:20]
+
+
+def _run_ffmpeg(args: list[str]) -> None:
+    completed = subprocess.run(
+        [str(BATCH.DEFAULT_FFMPEG), "-hide_banner", "-loglevel", "error", "-y", *args],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "ffmpeg failed")
+
+
+def _base_frame(clip: Path, position: float, width: int) -> Path:
+    """One 16-bit RGB still per clip/position/width, shared by every LUT.
+
+    The conversion to yuv444p16le then RGB is exactly what the bake's
+    `format=yuv444p16le,lut3d` chain does before the LUT sees a pixel, so the
+    LUT applied to this still matches the LUT applied during the render.
+    """
+    stat = clip.stat()
+    base = PREVIEW_DIR / f"base_{_cache_key(clip, stat.st_mtime, stat.st_size, position, width)}.png"
+    with _BASE_LOCK:
+        if not base.is_file():
+            duration = _probe_duration(clip)
+            seconds = min(duration * position / 100, max(duration - 0.1, 0.0))
+            _run_ffmpeg([
+                "-ss", f"{seconds:.3f}", "-i", str(clip), "-frames:v", "1",
+                "-vf", f"scale={width}:-2:flags=lanczos,format=yuv444p16le,format=rgb48le",
+                str(base),
+            ])
+    return base
+
+
+def render_preview(clip: str, position: float, lut: str, width: int) -> bytes:
+    """JPEG of one frame of `clip`, with `lut` applied when it is not empty."""
+    video = Path(clip).expanduser()
+    if not video.is_file() or video.suffix.lower() not in BATCH.DEFAULT_EXTENSIONS:
+        raise ValueError("Not a video clip")
+    lut_path = Path(lut).expanduser() if lut else None
+    if lut_path is not None and (not lut_path.is_file() or lut_path.suffix.lower() != ".cube"):
+        raise ValueError("LUT must be an existing .cube file")
+    if shutil.which(str(BATCH.DEFAULT_FFMPEG)) is None and not BATCH.DEFAULT_FFMPEG.is_file():
+        raise RuntimeError("ffmpeg not found; brew install ffmpeg")
+
+    width = min(PREVIEW_WIDTHS, key=lambda allowed: abs(allowed - width))
+    position = min(max(position, 0.0), 100.0)
+    base = _base_frame(video, position, width)
+    lut_stamp = lut_path.stat().st_mtime if lut_path else ""
+    out = PREVIEW_DIR / f"view_{_cache_key(base.name, lut_path or '', lut_stamp)}.jpg"
+    if not out.is_file():
+        chain = "format=rgb24"
+        if lut_path is not None:
+            chain = f"lut3d=file={BATCH._escape_filter_path(lut_path.resolve())},{chain}"
+        partial = out.with_suffix(".tmp.jpg")
+        _run_ffmpeg(["-i", str(base), "-vf", chain, "-q:v", "3", str(partial)])
+        partial.replace(out)
+    return out.read_bytes()
 
 
 def runs_dir(config: dict[str, Any]) -> Path:
@@ -208,14 +343,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- routes ------------------------------------------------------------
     def do_GET(self) -> None:
-        route = urllib.parse.urlparse(self.path).path
-        if route == "/":
-            if not self._authorised():
-                self._send(403, b"Invalid or missing token", "text/plain")
-                return
-            self._send(200, PAGE.replace("__TOKEN__", TOKEN).encode(), "text/html; charset=utf-8")
-        else:
+        parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
+        if route not in ("/", "/api/preview"):
             self._send(404, b"not found", "text/plain")
+            return
+        if not self._authorised():
+            self._send(403, b"Invalid or missing token", "text/plain")
+            return
+        if route == "/":
+            self._send(200, PAGE.replace("__TOKEN__", TOKEN).encode(), "text/html; charset=utf-8")
+            return
+        # <img src> can only issue GETs, so the preview takes its options as query parameters.
+        query = urllib.parse.parse_qs(parsed.query)
+        arg = lambda name, default="": query.get(name, [default])[0]
+        try:
+            image = render_preview(
+                arg("clip"), float(arg("pos", "30")), arg("lut"), int(arg("w", "360"))
+            )
+        except (ValueError, RuntimeError, OSError) as error:
+            self._send(400, str(error).encode(), "text/plain; charset=utf-8")
+            return
+        self._send(200, image, "image/jpeg")
 
     def do_POST(self) -> None:
         route = urllib.parse.urlparse(self.path).path
@@ -225,6 +374,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if route == "/api/choose":
                 self._json({"path": choose_path(self._body().get("kind", "folder"))})
+            elif route == "/api/clips":
+                self._json({"clips": list_clips(str(self._body().get("source") or ""))})
+            elif route == "/api/luts":
+                self._json({"luts": list_luts(str(self._body().get("folder") or ""))})
+            elif route == "/api/settings":
+                body = self._body()
+                self._json(save_settings(body) if body else load_settings())
             elif route == "/api/script":
                 script = write_script(self._body())
                 self._json({"path": str(script), "command": f"bash {shlex.quote(str(script))}"})
@@ -284,6 +440,26 @@ padding:9px 11px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;word-
 .err{color:var(--bad);margin-top:10px;min-height:18px;font-size:13px}
 .actions{display:flex;gap:9px;margin-top:16px;align-items:center}
 .actions .sp{flex:1}
+.preview{display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.preview .row{grid-template-columns:96px 1fr auto}
+.frame{display:flex;gap:10px;align-items:center}
+.frame select{flex:1;min-width:0}
+.frame input[type=range]{width:180px}
+.compare{position:relative;margin:4px 0 6px;border-radius:8px;overflow:hidden;background:#000;
+aspect-ratio:16/9;cursor:ew-resize;user-select:none;touch-action:none}
+.compare img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none}
+.compare .divider{position:absolute;top:0;bottom:0;width:2px;background:#fff;opacity:.85;pointer-events:none}
+.compare .tag{position:absolute;top:8px;padding:2px 7px;border-radius:5px;background:rgba(0,0,0,.55);
+color:#fff;font-size:12px;pointer-events:none}
+.compare .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+color:#98989d;font-size:13px;text-align:center;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px;
+max-height:520px;overflow:auto;padding:2px}
+.tile{border:2px solid transparent;border-radius:8px;cursor:pointer;background:var(--bg);overflow:hidden}
+.tile:hover{border-color:var(--line)}
+.tile.on{border-color:var(--accent)}
+.tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
+.tile div{padding:4px 7px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style></head><body><div class="wrap">
 <h1>Batch Gyroflow</h1>
 
@@ -299,6 +475,21 @@ padding:9px 11px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;word-
     <button data-pick="output" data-kind="folder">选择…</button></div>
   <div class="row" id="lutRow"><label>LUT</label><input type="text" id="lut" placeholder=".cube 文件">
     <button data-pick="lut" data-kind="cube">选择…</button></div>
+  <div class="preview" id="preview">
+    <div class="row"><label>LUT 库</label><input type="text" id="lut_dir" placeholder="放 .cube 的文件夹，含子文件夹">
+      <button data-pick="lut_dir" data-kind="folder">选择…</button></div>
+    <div class="row"><label>样张</label><div class="frame">
+      <select id="clip"><option value="">先选素材文件夹</option></select>
+      <input type="range" id="pos" min="0" max="100" value="30" title="在片段中的位置"></div><span></span></div>
+    <div class="compare" id="compare">
+      <img id="before" alt=""><img id="after" alt="">
+      <div class="divider" id="divider"></div>
+      <span class="tag" style="left:8px">原片</span><span class="tag" id="afterTag" style="right:8px">LUT</span>
+      <div class="empty" id="empty">选好素材文件夹和 LUT 后，这里显示套用前后的对比</div>
+    </div>
+    <div class="hint">在画面上拖动比较前后。点下面的缩略图直接选用该 LUT。</div>
+    <div class="grid" id="grid"></div>
+  </div>
 </div>
 
 <div class="card">
@@ -366,6 +557,7 @@ document.querySelectorAll(".modes button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll(".modes button").forEach(o=>o.setAttribute("aria-pressed",o===b));
   $("lutRow").style.opacity = mode==="stabilize" ? .45 : 1;
   $("lut").disabled = mode==="stabilize";
+  $("preview").style.display = mode==="stabilize" ? "none" : "block";
   // Crop only exists when Gyroflow actually stabilises.
   $("cropWrap").style.opacity = mode==="lut_only" ? .45 : 1;
   $("crop").disabled = mode==="lut_only";
@@ -373,10 +565,95 @@ document.querySelectorAll(".modes button").forEach(b=>b.onclick=()=>{
 
 document.querySelectorAll("[data-pick]").forEach(b=>b.onclick=async()=>{
   b.disabled=true;
-  try{ const {path}=await api("/api/choose",{kind:b.dataset.kind}); if(path) $(b.dataset.pick).value=path; }
+  try{
+    const {path}=await api("/api/choose",{kind:b.dataset.kind});
+    if(path){ $(b.dataset.pick).value=path; $(b.dataset.pick).dispatchEvent(new Event("change")); }
+  }
   catch(e){ $("err").textContent=e.message; }
   finally{ b.disabled=false; }
 });
+
+// -- LUT preview ------------------------------------------------------------
+const frameUrl=(lut,w)=>"/api/preview?"+new URLSearchParams(
+  {token:T,clip:$("clip").value,pos:$("pos").value,lut:lut||"",w});
+const stem=p=>p.split("/").pop().replace(/\.cube$/i,"");
+const parent=p=>p.replace(/\/+$/,"").replace(/\/[^/]*$/,"");
+
+const showCompare=()=>{
+  const clip=$("clip").value, lut=$("lut").value.trim();
+  $("empty").style.display = clip ? "none" : "flex";
+  if(!clip){ $("before").removeAttribute("src"); $("after").removeAttribute("src"); return; }
+  $("before").src=frameUrl("",1280);
+  if(lut){ $("after").src=frameUrl(lut,1280); $("afterTag").textContent=stem(lut); }
+  else { $("after").removeAttribute("src"); $("afterTag").textContent="未选 LUT"; }
+  document.querySelectorAll(".tile").forEach(t=>t.classList.toggle("on",t.dataset.lut===lut));
+};
+
+let luts=[];
+const showGrid=()=>{
+  const grid=$("grid"); grid.innerHTML="";
+  if(!$("clip").value) return;
+  luts.forEach(lut=>{
+    const tile=document.createElement("div"); tile.className="tile"; tile.dataset.lut=lut; tile.title=lut;
+    const img=document.createElement("img"); img.loading="lazy"; img.src=frameUrl(lut,360);
+    img.onerror=()=>{ name.textContent="⚠️ "+stem(lut)+"（无法读取）"; };
+    const name=document.createElement("div"); name.textContent=stem(lut);
+    tile.append(img,name);
+    tile.onclick=()=>{ $("lut").value=lut; showCompare(); };
+    grid.append(tile);
+  });
+  showCompare();
+};
+
+const loadLuts=async()=>{
+  try{ luts=(await api("/api/luts",{folder:$("lut_dir").value})).luts; }
+  catch(e){ luts=[]; $("err").textContent=e.message; }
+  showGrid();
+};
+
+const loadClips=async()=>{
+  const select=$("clip"), source=$("source").value.trim();
+  let clips=[];
+  try{ if(source) clips=(await api("/api/clips",{source})).clips; }
+  catch(e){ $("err").textContent=e.message; }
+  select.innerHTML="";
+  if(!clips.length){
+    select.append(new Option(source?"素材文件夹里没有视频":"先选素材文件夹",""));
+  }
+  clips.forEach(c=>select.append(new Option(c.startsWith(source)?c.slice(source.replace(/\/+$/,"").length+1):c,c)));
+  showGrid();
+};
+
+$("source").addEventListener("change",loadClips);
+$("clip").addEventListener("change",showGrid);
+$("pos").addEventListener("change",showGrid);
+$("lut").addEventListener("change",()=>{
+  const lut=$("lut").value.trim();
+  // A LUT picked on its own seeds the library with its folder.
+  if(lut && !$("lut_dir").value.trim()){
+    $("lut_dir").value=parent(lut); $("lut_dir").dispatchEvent(new Event("change"));
+  } else showCompare();
+});
+$("lut_dir").addEventListener("change",()=>{
+  api("/api/settings",{lut_dir:$("lut_dir").value.trim()}).catch(()=>{});
+  loadLuts();
+});
+
+let split=50;
+const setSplit=x=>{
+  split=Math.min(100,Math.max(0,x));
+  $("after").style.clipPath=`inset(0 0 0 ${split}%)`;
+  $("divider").style.left=`calc(${split}% - 1px)`;
+};
+setSplit(50);
+$("compare").addEventListener("pointerdown",e=>{
+  const box=$("compare"), move=ev=>{const r=box.getBoundingClientRect(); setSplit((ev.clientX-r.left)/r.width*100);};
+  box.setPointerCapture(e.pointerId); move(e);
+  box.onpointermove=move;
+  box.onpointerup=()=>{ box.onpointermove=null; };
+});
+
+api("/api/settings").then(s=>{ if(s.lut_dir){ $("lut_dir").value=s.lut_dir; loadLuts(); } }).catch(()=>{});
 
 const val=id=>{const el=$(id); return el.type==="checkbox"?el.checked:el.value.trim();};
 const config=dry=>({mode,dry_run:dry,
@@ -435,6 +712,7 @@ def main() -> int:
         pass
     finally:
         server.server_close()
+        shutil.rmtree(PREVIEW_DIR, ignore_errors=True)
     return 0
 
 

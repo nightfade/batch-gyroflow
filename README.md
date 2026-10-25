@@ -41,7 +41,7 @@ updates the tool without rebuilding.
 ```
 
 Double-clicking it starts a loopback web server and opens the page in your
-browser. It exposes mode, source, output, LUT, max crop and date naming, with
+browser. It exposes mode, source, output, LUT (with a [preview](#lut-preview)), max crop and date naming, with
 codec / bitrate / jobs / timeout / rolling-shutter behind **高级选项**.
 
 The page does not run the batch itself. **生成脚本** (or **生成试跑脚本**)
@@ -59,6 +59,24 @@ directory, so editing `batch_gyroflow.py` takes effect immediately.
 
 `gui.py` also runs standalone (`python3 gui.py`) if you would rather not
 install an app.
+
+### LUT preview
+
+In the two LUT modes a preview panel opens under the LUT field:
+
+- **LUT 库** is a folder of `.cube` files, subfolders included. Every LUT in
+  it gets a thumbnail graded on the same frame. Click one to select it. The
+  folder is remembered in `~/Library/Application Support/BatchGyroflow/gui.json`.
+  If you pick a single LUT first, its folder becomes the library.
+- **样张** is any clip from the source folder. The slider sets where in the
+  clip the frame is taken.
+- The large view is a before/after split. Drag across it to move the divider.
+
+The frame goes through the same `format=yuv444p16le` → `lut3d` path as the
+render. On test footage the preview matches the delivered file to within a few
+8-bit levels. The remaining difference is the delivery encode's 4:2:0 chroma.
+Frames are cached in a temp folder that is deleted on quit, so each extra LUT
+costs a fraction of a second.
 
 Notes:
 
