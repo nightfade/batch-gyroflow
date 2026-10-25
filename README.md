@@ -1,5 +1,7 @@
 # Gyroflow Batch Stabilization
 
+> **This project has moved into [LightTable](https://github.com/nightfade/LightTable) and is no longer updated.** Batch stabilisation and LUT grading continue there as a native Mac app with no Python, Homebrew or Terminal needed. This repository is kept as an archive.
+
 `batch_gyroflow.py` recursively finds video files and processes them in one of
 three modes. Source videos are never modified; output is written below an
 excluded `gyroflow_stabilized/` folder, preserving the source tree.
